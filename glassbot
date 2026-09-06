@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# glassbot — entry point for the GlassyOS local AI assistant.
+#
+# Default (no args, on a graphical Hyprland session): toggles the Quickshell
+# widget. With arguments: forwards to glassbot-backend as a one-shot chat
+# (prints the streamed reply to stdout). --tui drops into a small terminal chat.
+
+set -euo pipefail
+
+BACKEND="${HOME}/.local/bin/glassbot-backend"
+QS_MANAGER="${HOME}/.config/hypr/scripts/qs_manager.sh"
+
+usage() {
+    cat <<EOF
+glassbot — local AI assistant for GlassyOS
+
+usage:
+  glassbot                          toggle the Quickshell chat widget
+  glassbot <message ...>            one-shot chat, streams reply to stdout
+  glassbot /search <query ...>      one-shot web-search-augmented reply
+  glassbot --tui                    minimal terminal chat
+  glassbot --reset                  clear persisted conversation history
+  glassbot --status                 print backend / ollama status
+  glassbot --version
+
+keybind: SUPER+CTRL+A toggles the widget.
+config:  ~/.config/glassbot/config.json   (model, ollama_url, search_results)
+history: ~/.cache/glassbot/history.json
+EOF
+}
+
+have_widget() {
+    [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && [[ -x "$QS_MANAGER" ]]
+}
+
+case "${1:-}" in
+    "" )
+        if have_widget; then
+            exec bash "$QS_MANAGER" toggle glassbot
+        fi
+        echo "glassbot: not in a Hyprland session — falling back to --tui" >&2
+        exec "$0" --tui
+        ;;
+    --version )
+        echo "glassbot 0.1.0"
+        exec "$BACKEND" --version
+        ;;
+    -h|--help )
+        usage
+        ;;
+    --reset )
+        exec "$BACKEND" reset
+        ;;
+    --status )
+        exec "$BACKEND" status
+        ;;
+    --tui )
+        echo "glassbot — local AI assistant for GlassyOS"
+        echo "type your message and press Enter. Ctrl-D or /quit to exit. /reset clears history."
+        echo
+        while IFS= read -r -p "you ▸ " line; do
+            [[ -z "$line" ]] && continue
+            case "$line" in
+                /quit|/exit) exit 0 ;;
+                /reset|/clear|/new)
+                    "$BACKEND" reset >/dev/null
+                    echo "(history cleared)"
+                    continue
+                    ;;
+            esac
+            printf 'bot ▸ '
+            "$BACKEND" chat "$line"
+            echo
+        done
+        ;;
+    * )
+        exec "$BACKEND" chat "$@"
+        ;;
+esac

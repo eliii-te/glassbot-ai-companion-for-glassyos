@@ -1,0 +1,12 @@
+{
+    "model": "llama3.2:3b",
+    "ollama_url": "http://localhost:11434",
+    "search_results": 5,
+    "backend": "auto",
+    "cloud_provider": "openrouter",
+    "cloud_url": "https://openrouter.ai/api/v1/chat/completions",
+    "cloud_model": "openai/gpt-oss-120b:free",
+    "cloud_api_key": "",
+    "setup_done": false,
+    "tools_enabled": true
+}

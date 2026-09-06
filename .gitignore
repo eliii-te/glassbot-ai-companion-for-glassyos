@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# never commit real secrets or chat history
+config.json
+history.json

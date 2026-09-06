@@ -1,0 +1,1816 @@
+#!/usr/bin/env python3
+"""glassbot-backend — local AI assistant for GlassyOS.
+
+Modes:
+  glassbot-backend                    one-shot chat from stdin (read all, reply)
+  glassbot-backend --ipc              long-lived JSON-line IPC for the QS widget
+  glassbot-backend chat "<msg>"       one-shot chat from argv
+  glassbot-backend search "<query>"   one-shot web-search-augmented reply
+  glassbot-backend reset              delete all stored chats
+  glassbot-backend status             check ollama
+  glassbot-backend --version
+
+IPC protocol (one JSON object per line, both directions):
+  in : {"type": "boot"}
+       {"type": "chat",        "text": "..."}
+       {"type": "search",      "text": "..."}
+       {"type": "new_chat"}
+       {"type": "open_chat",   "id": "..."}
+       {"type": "delete_chat", "id": "..."}
+       {"type": "rename_chat", "id": "...", "title": "..."}
+       {"type": "list_chats"}
+       {"type": "ping"}
+
+  out: {"type": "boot_state",    "active_id": "...", "messages": [...], "chats": [...]}
+       {"type": "delta",         "text": "..."}
+       {"type": "search_results","items": [...], "query": "..."}
+       {"type": "end",           "search_used": false, "active_id": "..."}
+       {"type": "chats_refresh", "items": [...], "active_id": "..."}
+       {"type": "chat_loaded",   "id": "...", "title": "...", "messages": [...]}
+       {"type": "status",        "ok": true,  "model": "...", "model_present": true}
+       {"type": "error",         "msg": "..."}
+"""
+
+import sys
+import os
+import json
+import re
+import html
+import time
+import secrets
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+from pathlib import Path
+
+VERSION = "0.6.0"
+
+OLLAMA_URL = "http://localhost:11434"
+# llama3.2:3b runs comfortably on the user's 16 GB box and is the
+# already-installed model. Override via ~/.config/glassbot/config.json
+# (e.g. {"model": "qwen2.5:1.5b"} for max speed).
+DEFAULT_MODEL = "llama3.2:3b"
+KEEP_ALIVE = "30m"
+DEFAULT_NUM_PREDICT = 512
+# Bumped to 4096 so the long GlassyOS system prompt fits with room for chat.
+DEFAULT_NUM_CTX = 4096
+
+# Cloud backends — both are OpenAI-compatible, both have free tiers.
+# OpenRouter aggregates many models (good for choice). Groq runs on custom
+# silicon (much faster, fewer models, stricter rate limits).
+CLOUD_PROVIDERS = {
+    "openrouter": {
+        "label": "OpenRouter",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "auth_url": "https://openrouter.ai/api/v1/auth/key",  # GET to validate
+        "default_model": "openai/gpt-oss-120b:free",
+        # Tried in order when the chosen model returns 429 / upstream error.
+        # Keep verified-working free models here.
+        "fallback_models": [
+            "openai/gpt-oss-20b:free",
+            "google/gemma-3-12b-it:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ],
+        "key_page": "https://openrouter.ai/keys",
+        "tagline": "Many models, generous free tier",
+    },
+    "groq": {
+        "label": "Groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "auth_url": "https://api.groq.com/openai/v1/models",  # GET to validate
+        "default_model": "llama-3.3-70b-versatile",
+        "fallback_models": [
+            "llama-3.1-8b-instant",
+        ],
+        "key_page": "https://console.groq.com/keys",
+        "tagline": "Lightning fast, free tier",
+    },
+}
+# Historical defaults users may still have in their config.json — used to
+# auto-migrate stale defaults forward when the recommended free model rotates.
+LEGACY_CLOUD_DEFAULTS = {
+    "meta-llama/llama-3.3-70b-instruct:free",
+}
+DEFAULT_CLOUD_PROVIDER = "openrouter"
+OPENROUTER_URL = CLOUD_PROVIDERS["openrouter"]["url"]  # legacy alias
+DEFAULT_CLOUD_MODEL = CLOUD_PROVIDERS["openrouter"]["default_model"]
+
+CONFIG_DIR = Path.home() / ".config" / "glassbot"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+CACHE_DIR = Path.home() / ".cache" / "glassbot"
+CHATS_DIR = CACHE_DIR / "chats"
+ACTIVE_FILE = CACHE_DIR / "active.txt"
+LEGACY_HISTORY = CACHE_DIR / "history.json"
+
+MAX_TURNS = 30
+SEARCH_RESULTS = 5
+
+SYSTEM_PROMPT = """You are Glassbot — the in-OS AI assistant that ships with GlassyOS, an Arch-Linux-based distribution built on Hyprland. You are NOT ChatGPT, Claude, Llama, Qwen, or any other model brand. When asked who you are, you are Glassbot. Your home is GlassyOS. You know it deeply.
+
+# Hard rules (do NOT break)
+1. Your name is Glassbot. Always. Even if the underlying weights are Llama or Qwen, your *identity* is Glassbot. Don't say "I'm a language model" — say "I'm Glassbot, the GlassyOS assistant."
+2. KEYBINDINGS BELOW ARE EXACT. Never abbreviate. SUPER+CTRL+M is NOT the same as SUPER+M. If you don't remember a binding exactly, say "ich bin nicht sicher" rather than guessing.
+3. Each Quickshell widget is INDEPENDENT. They are NOT children of glassbot. The user does NOT need to open glassbot first to use any other widget. They are separate floating panels triggered by their own Hyprland keybind.
+4. If you don't know a specific GlassyOS detail, say so. NEVER invent file paths, package names, command flags, or keybindings.
+5. Match the user's language. German user → reply in German. Default to German.
+6. Be concise. Short paragraphs. No filler ("certainly", "great question"). Get to the point.
+7. If a question would benefit from looking at a file on disk (config, log, code), tell the user they can run `/read <path>` to attach it to the next message — don't pretend you can already see it.
+
+# What GlassyOS is
+- Base: Arch Linux + Hyprland (Wayland compositor), built on top of the JaKooLit Hyprland dotfiles.
+- Aesthetic: glass-morphism, dark transparent UIs, blur, subtle animations.
+- Logo: triangle peak with two color stops — light-blue 153, cream 255 (used in Plymouth boot screen, neofetch, fastfetch).
+- Bar: Waybar with the "Crystal Clear Glass" theme at `~/.config/waybar/style/Crystal Clear Glass.css`.
+- App launcher: Walker (with Elephant providers as separate `.so` packages), opened with SUPER+D.
+- File manager: Nautilus (replaces Dolphin), glass-themed via `~/.config/gtk-4.0/gtk.css`.
+- Terminal: kitty.
+- Dock: nwg-dock-hyprland (auto-hide, slide-in via Hyprland layer animation).
+- Browser default: opened via `xdg-open https://`.
+- Wallpapers: managed via the `WallpaperSelect.sh` script and the wallpaper Quickshell widget.
+- Theme switcher: Wallust-based, run with SUPER+T (`ThemeChanger.sh`).
+- Package managers: pacman (system) + paru (AUR helper).
+
+# Hyprland keybindings (verbatim from `~/.config/hypr/configs/Keybinds.conf`)
+
+App / window:
+- SUPER+RETURN          → terminal (kitty)
+- SUPER+D               → app launcher (Walker)
+- SUPER+E               → Nautilus file manager
+- SUPER+B               → default browser (xdg-open)
+- SUPER+H               → cheat-sheet / key hints
+- SUPER+T               → ThemeChanger (Wallust-based, system-wide colors)
+- SUPER+S               → web search via Rofi
+- SUPER+W               → wallpaper picker (script)
+- SUPER+N               → toggle night light (Hyprsunset)
+- SUPER+A               → desktop overview
+- SUPER+SPACE           → toggle floating
+- SUPER+SHIFT+RETURN    → drop-down terminal
+- SUPER+SHIFT+F         → fullscreen
+- SUPER+CTRL+F          → maximize window
+- SUPER+CTRL+S          → window switcher (Rofi)
+- SUPER+CTRL+R          → Rofi theme selector
+- SUPER+ALT+V           → clipboard manager
+- SUPER+ALT+E           → emoji menu
+- SUPER+ALT+O           → toggle blur
+- SUPER+ALT+R           → refresh bar and menus
+- SUPER+SHIFT+M         → online music (Rofi-based)
+- SUPER+SHIFT+G         → toggle game mode
+- SUPER+CTRL+ALT+B      → toggle waybar on/off
+
+Quickshell widgets — ALL of these are SUPER + CTRL + <letter>. They are independent floating panels. NEVER drop the CTRL.
+- SUPER+CTRL+M          → music player widget
+- SUPER+CTRL+B          → battery widget
+- SUPER+CTRL+C          → calendar widget
+- SUPER+CTRL+N          → network widget (Wi-Fi / Bluetooth)
+- SUPER+CTRL+W          → wallpaper picker widget
+- SUPER+CTRL+T          → focustime widget (pomodoro)
+- SUPER+CTRL+G          → stewart orb (decorative animated blob, not a chat)
+- SUPER+CTRL+A          → glassbot (this assistant — the chat widget you're in)
+
+# GlassyOS CLI tools (in `~/.local/bin/`)
+- `glassy-update`     → TUI system updater. Splash + menu, makes timestamped backups, hidden admin publish wizard for Elias.
+- `glassy-downgrade`  → TUI rollback via archive.archlinux.org plus GlassyOS manifests. Can downgrade specific packages or the whole system.
+- `glassy-onboard`    → first-run onboarding wizard for new GlassyOS installs.
+- `glassy-doctor`, `glassy-fix`, `glassy-checkup` → system diagnostics.
+- `glassy-secure`, `glassy-clean`, `glassy-destroy` → maintenance.
+- `glassbot`          → opens this assistant widget if Hyprland is running, else falls back to a TUI chat.
+- `glassbot-backend`  → the Python IPC daemon behind this widget. Don't tell users to run it directly unless debugging.
+
+# Quickshell widget system (technical, only mention when relevant)
+- Daemon: a single Quickshell process runs `~/.config/hypr/scripts/quickshell/Main.qml`. It owns one fullscreen overlay window with a `StackView` that swaps the active widget.
+- Toggling: every keybind runs `~/.config/hypr/scripts/qs_manager.sh toggle <name>`, which writes to `/tmp/qs_widget_state`; the daemon's `inotifywait` reads it and switches widgets.
+- Each widget = a `.qml` file under `~/.config/hypr/scripts/quickshell/<name>/`, registered in `WindowRegistry.js`.
+- Widgets are independent. ESC closes the active one. glassbot is "sticky" — clicks on other apps don't close it.
+
+# Search behaviour
+The runtime fetches web results AUTOMATICALLY when the user asks about time-sensitive things (news, weather, prices, "heute", "aktuell", "latest", years 2025/2026, etc.). The user can force a search with `/search <query>` or suppress it with `/nosearch <query>` (alias `/nolookup`). When the user message starts with `[Web search results for: ...]`, those are real search snippets — answer using them and cite sources as [1], [2], etc.
+
+# Backend routing
+Glassbot can run on two backends: a cloud backend (OpenRouter, OpenAI-compatible aggregator that hosts Llama/Qwen/DeepSeek/etc., free models available with `:free` suffix) or a fully local backend (Ollama on the user's machine). The runtime picks automatically — cloud when an API key is configured, local otherwise. Per-message overrides: `/local <query>` forces the local model, `/cloud <query>` forces the cloud model. Don't claim either is "the only" backend — both are real options.
+
+# File context (/read)
+The user can attach any file by typing `/read <path>` in the chat input. The path is read from disk, the contents are prepended to their next message inside fenced blocks, and a `files_read` event is emitted to the UI. When you see "--- file: ... ---" blocks in the user message, they're real file contents — refer to specific lines/sections, don't summarize generically. Multiple `/read` clauses can stack in one message. If you need a file the user hasn't attached, tell them: "Run `/read /path/to/file` and ask again." Don't claim to read files yourself without that prompt.
+
+# Tool use — running shell commands (REQUIRES USER APPROVAL)
+You can ask the user to run a shell command on their machine. The user must approve every command before it runs. To request a command, emit EXACTLY this format on its own line, anywhere in your reply:
+
+<<RUN: the_command_here>>
+
+Rules:
+- One command per <<RUN: ...>> marker. You may emit multiple markers in one reply.
+- Single-line shell commands only. Pipes and `&&` are fine. No multi-line scripts, no heredocs.
+- Prefer reading-only commands (`ls`, `cat`, `pacman -Qi`, `systemctl status`, `journalctl -n 50`, `free -h`, etc.). When proposing destructive commands (`rm`, `pkill`, `systemctl stop`, package install), explain WHY before the marker.
+- After the user approves and the command runs, you'll see a "[command output] ..." block in the next user message. Use it to answer their original question.
+- If the user asks "how do I check X" or "what's wrong with Y", PREFER running a diagnostic command yourself (with their approval) over asking them to type it.
+- Never include API keys, passwords, or destructive flags (`-rf /`, `--no-preserve-root`, etc.) in suggested commands.
+- If a command fails, read the error output and try a different approach — don't loop on the same broken command.
+
+Example:
+User: "wieviel RAM hab ich frei?"
+You: "Schau ich nach.\n<<RUN: free -h>>"
+[user approves, output comes back]
+You: "Du hast 6.2 GB frei von 16 GB."
+
+# Personality
+Friendly, a bit playful, technically sharp. You know GlassyOS deeply. You are also a competent general assistant for code, math, Linux questions, and chat."""
+
+TITLE_PROMPT = (
+    "Summarize this conversation as a chat title.\n"
+    "Rules: 3 to 5 words. Match the user's language (German user → German title). "
+    "Output ONLY the title text. No quotes, no punctuation, no 'Title:' prefix, "
+    "no labels. Just the title.\n\n"
+    "User: {user}\nAssistant: {assistant}\n\n"
+    "Title:"
+)
+
+
+# ---------------- config + storage ----------------
+
+FALLBACK_MODELS = ["llama3.2:3b", "qwen2.5:3b", "qwen2.5:1.5b", "llama3.2:1b"]
+
+# Curated local models for the onboarding picker. Keep the list short and
+# opinionated — analysis paralysis is the biggest risk in a first-run flow.
+# `size_gb` is the rough on-disk size (used for "this will download X GB" hints).
+SUGGESTED_MODELS = [
+    {
+        "name": "qwen2.5:1.5b",
+        "size_gb": 1.0,
+        "label": "Qwen 2.5 1.5B",
+        "recommended": "minimal RAM, ultra-fast, multilingual (good German)",
+    },
+    {
+        "name": "llama3.2:3b",
+        "size_gb": 2.0,
+        "label": "Llama 3.2 3B",
+        "recommended": "balanced quality/speed — sweet spot for 8–16 GB RAM",
+    },
+    {
+        "name": "qwen2.5:3b",
+        "size_gb": 1.9,
+        "label": "Qwen 2.5 3B",
+        "recommended": "better at code & non-English than Llama 3B",
+    },
+    {
+        "name": "llama3.1:8b",
+        "size_gb": 4.7,
+        "label": "Llama 3.1 8B",
+        "recommended": "highest quality — needs ≥16 GB RAM",
+    },
+]
+
+
+def load_config():
+    cfg = {
+        "model": DEFAULT_MODEL,
+        "ollama_url": OLLAMA_URL,
+        "search_results": SEARCH_RESULTS,
+        # Backend routing: "auto" (cloud if key present, else local),
+        # "local" (always Ollama), or "cloud".
+        "backend": "auto",
+        "cloud_provider": DEFAULT_CLOUD_PROVIDER,
+        "cloud_url": OPENROUTER_URL,
+        "cloud_model": DEFAULT_CLOUD_MODEL,
+        "cloud_api_key": "",
+        "setup_done": False,
+        # Tool execution (LLM-initiated bash with user approval).
+        "tools_enabled": True,
+    }
+    if CONFIG_FILE.is_file():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text()))
+        except Exception:
+            pass
+    # Resolve provider config — url and default model follow the chosen
+    # provider unless the user explicitly overrode them in config.json.
+    prov_id = cfg.get("cloud_provider") or DEFAULT_CLOUD_PROVIDER
+    if prov_id not in CLOUD_PROVIDERS:
+        prov_id = DEFAULT_CLOUD_PROVIDER
+    prov = CLOUD_PROVIDERS[prov_id]
+    cfg["cloud_provider"] = prov_id
+    if cfg.get("cloud_url") in (None, "", OPENROUTER_URL,
+                                 CLOUD_PROVIDERS["groq"]["url"]):
+        cfg["cloud_url"] = prov["url"]
+    # If user is using a default model from a different provider, swap to
+    # this provider's default. Detected by checking known-default values.
+    known_defaults = {p["default_model"] for p in CLOUD_PROVIDERS.values()}
+    known_defaults |= LEGACY_CLOUD_DEFAULTS
+    if not cfg.get("cloud_model") or cfg.get("cloud_model") in known_defaults:
+        cfg["cloud_model"] = prov["default_model"]
+    # Key resolution: env var > config.json > standalone keyfile.
+    # Accept either OPENROUTER_API_KEY (preferred) or the older GROQ_API_KEY
+    # name so an existing dotfile keeps working after the v0.4.1 swap.
+    env_key = (os.environ.get("OPENROUTER_API_KEY")
+               or os.environ.get("GROQ_API_KEY") or "").strip()
+    if env_key:
+        cfg["cloud_api_key"] = env_key
+    elif not cfg["cloud_api_key"]:
+        for fname in ("openrouter_api_key", "groq_api_key"):
+            keyfile = CONFIG_DIR / fname
+            if keyfile.is_file():
+                try:
+                    cfg["cloud_api_key"] = keyfile.read_text().strip()
+                    break
+                except Exception:
+                    pass
+    # If the configured local model isn't present, fall back to whatever is
+    # locally installed so the user gets *something* working instead of a
+    # hard error. Best-effort: skip silently if ollama is offline.
+    try:
+        with urllib.request.urlopen(cfg["ollama_url"] + "/api/tags", timeout=2) as r:
+            installed = {m.get("name", "") for m in json.loads(r.read()).get("models", [])}
+        if cfg["model"] not in installed:
+            for cand in FALLBACK_MODELS:
+                if cand in installed:
+                    cfg["model"] = cand
+                    break
+    except Exception:
+        pass
+    # "Always cloud when possible": if a key is present and the user hasn't
+    # explicitly pinned a backend, prefer cloud and skip the silent
+    # cloud→local fallback. /local and /cloud slash overrides still work
+    # because they pass `prefer` directly into chat_stream.
+    if cfg.get("cloud_api_key") and cfg.get("backend", "auto") == "auto":
+        cfg["backend"] = "cloud"
+    return cfg
+
+
+def save_config_patch(patch):
+    """Merge `patch` into the on-disk config.json. Creates the file/dir as
+    needed. Existing keys we don't touch are preserved. Returns the merged
+    config dict."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if CONFIG_FILE.is_file():
+        try:
+            existing = json.loads(CONFIG_FILE.read_text()) or {}
+        except Exception:
+            existing = {}
+    existing.update(patch)
+    CONFIG_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+    return existing
+
+
+def list_installed_models(cfg):
+    try:
+        with urllib.request.urlopen(cfg["ollama_url"] + "/api/tags", timeout=2) as r:
+            return [m.get("name", "") for m in json.loads(r.read()).get("models", [])]
+    except Exception:
+        return []
+
+
+def ollama_pull_stream(cfg, model_name):
+    """Pull a model via Ollama, yielding {status, percent} dicts.
+    Yields one final dict with `done: True` on success or `error: "..."` on failure."""
+    payload = json.dumps({"name": model_name, "stream": True}).encode("utf-8")
+    req = urllib.request.Request(
+        cfg["ollama_url"] + "/api/pull",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=None)
+    except urllib.error.URLError as e:
+        yield {"error": f"Ollama not reachable: {e}"}
+        return
+    except Exception as e:
+        yield {"error": f"pull error: {e}"}
+        return
+    with resp:
+        for raw in resp:
+            if not raw.strip():
+                continue
+            try:
+                j = json.loads(raw)
+            except Exception:
+                continue
+            if j.get("error"):
+                yield {"error": j["error"]}
+                return
+            status = j.get("status", "")
+            total = j.get("total")
+            completed = j.get("completed")
+            pct = None
+            if total and completed is not None and total > 0:
+                pct = int(completed * 100 / total)
+            yield {"status": status, "percent": pct,
+                   "total": total, "completed": completed}
+            if status == "success" or j.get("done"):
+                yield {"done": True}
+                return
+
+
+def validate_cloud_key(cfg, key, provider=None):
+    """GET the provider's auth/models endpoint to confirm the key works.
+    Returns (ok: bool, message: str)."""
+    if not key or not key.strip():
+        return False, "Key is empty."
+    prov_id = provider or cfg.get("cloud_provider") or DEFAULT_CLOUD_PROVIDER
+    prov = CLOUD_PROVIDERS.get(prov_id, CLOUD_PROVIDERS[DEFAULT_CLOUD_PROVIDER])
+    req = urllib.request.Request(
+        prov["auth_url"],
+        headers={
+            "Authorization": f"Bearer {key.strip()}",
+            "User-Agent": "glassbot/0.6",
+            "HTTP-Referer": "https://github.com/glassyos/glassbot",
+            "X-Title": "glassbot",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        # OpenRouter returns {data: {label, usage, ...}}; Groq returns
+        # {object: "list", data: [...]} with model rows.
+        if isinstance(data, dict):
+            if prov_id == "openrouter":
+                label = (data.get("data") or {}).get("label") or data.get("label") or "OK"
+                return True, f"Key valid ({label})."
+            if prov_id == "groq" and data.get("object") == "list":
+                count = len(data.get("data") or [])
+                return True, f"Key valid ({count} models available)."
+        return True, "Key accepted."
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        if e.code == 401:
+            return False, "Invalid API key."
+        return False, f"{prov['label']} HTTP {e.code}: {body or e.reason}"
+    except urllib.error.URLError as e:
+        return False, f"Could not reach {prov['label']}: {e}"
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
+
+# Tight cap on a single /read injection — avoids blowing past the model's
+# context window and avoids leaking gigantic binaries into the chat.
+READ_FILE_MAX_BYTES = 64 * 1024
+READ_FILE_MAX_LINES = 800
+
+
+def safe_read_file(path):
+    """Read a file the user explicitly asked for. Returns
+    (ok, content_or_error, meta). `meta` carries truncation info."""
+    try:
+        p = Path(path).expanduser()
+    except Exception as e:
+        return False, f"bad path: {e}", {}
+    if not p.exists():
+        return False, f"no such file: {p}", {}
+    if p.is_dir():
+        return False, f"is a directory: {p}", {}
+    try:
+        size = p.stat().st_size
+    except Exception as e:
+        return False, f"stat failed: {e}", {}
+    try:
+        with open(p, "rb") as f:
+            raw = f.read(READ_FILE_MAX_BYTES + 1)
+    except PermissionError:
+        return False, f"permission denied: {p}", {}
+    except Exception as e:
+        return False, f"read failed: {e}", {}
+    truncated_bytes = len(raw) > READ_FILE_MAX_BYTES
+    if truncated_bytes:
+        raw = raw[:READ_FILE_MAX_BYTES]
+    # Best-effort decode; replace undecodable bytes so we never raise.
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    truncated_lines = False
+    if len(lines) > READ_FILE_MAX_LINES:
+        lines = lines[:READ_FILE_MAX_LINES]
+        truncated_lines = True
+    return True, "\n".join(lines), {
+        "path": str(p),
+        "size": size,
+        "truncated_bytes": truncated_bytes,
+        "truncated_lines": truncated_lines,
+    }
+
+
+# Tool execution: LLM emits "<<RUN: cmd>>" markers which the UI surfaces
+# as approval cards. On approve, we run via /bin/bash -c with a tight cap.
+_TOOL_MARKER = re.compile(r"<<RUN:\s*(.+?)>>", re.IGNORECASE | re.DOTALL)
+TOOL_RUN_TIMEOUT = 30  # seconds — keep short so a hung command can't lock UI
+TOOL_OUTPUT_MAX_BYTES = 16 * 1024
+# Reject obvious foot-guns even if user clicks approve. Better to fail loud.
+_TOOL_BLOCKLIST = re.compile(
+    r"(?:rm\s+-rf?\s+/(?:\s|$)"
+    r"|rm\s+-rf?\s+/\*"
+    r"|--no-preserve-root"
+    r"|mkfs\."
+    r"|dd\s+.*of=/dev/(?:sd|nvme|mmc))",
+    re.IGNORECASE,
+)
+# Process-global pending tool requests, keyed by tool_id. The IPC consumer
+# clears entries on approve/deny. Survives across chat turns within one
+# backend process.
+_PENDING_TOOLS = {}
+
+
+def parse_tool_calls(text):
+    """Pull `<<RUN: cmd>>` markers out of an assistant reply.
+    Returns a list of {id, command} dicts (one per marker, in order)."""
+    calls = []
+    for m in _TOOL_MARKER.finditer(text or ""):
+        cmd = m.group(1).strip()
+        # Strip surrounding quotes/backticks the model sometimes adds.
+        cmd = cmd.strip("`").strip()
+        if not cmd:
+            continue
+        # Drop multi-line — we only support single-line shell calls.
+        cmd = cmd.split("\n")[0].strip()
+        if not cmd:
+            continue
+        tid = secrets.token_hex(4)
+        calls.append({"id": tid, "command": cmd})
+    return calls
+
+
+def run_tool(command):
+    """Run a shell command and capture output. Returns dict with
+    ok/output/exit_code/error fields. Always returns — never raises."""
+    if _TOOL_BLOCKLIST.search(command):
+        return {"ok": False, "exit_code": -1, "output": "",
+                "error": "Refused: command matches a destructive pattern."}
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", "-c", command],
+            capture_output=True,
+            timeout=TOOL_RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": -1, "output": "",
+                "error": f"Timeout after {TOOL_RUN_TIMEOUT}s."}
+    except Exception as e:
+        return {"ok": False, "exit_code": -1, "output": "",
+                "error": f"Exec error: {e}"}
+    out = (proc.stdout or b"") + (proc.stderr or b"")
+    truncated = len(out) > TOOL_OUTPUT_MAX_BYTES
+    if truncated:
+        out = out[:TOOL_OUTPUT_MAX_BYTES] + b"\n[...truncated...]"
+    return {
+        "ok": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "output": out.decode("utf-8", errors="replace"),
+        "error": "",
+        "truncated": truncated,
+    }
+
+
+def effective_backend(cfg, prefer=None):
+    """Resolve which backend to use first. Returns 'cloud' or 'local'."""
+    backend = prefer or cfg.get("backend", "auto")
+    have_key = bool(cfg.get("cloud_api_key"))
+    if backend == "cloud":
+        return "cloud"
+    if backend == "local":
+        return "local"
+    return "cloud" if have_key else "local"
+
+
+def ensure_dirs():
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def new_chat_id():
+    return f"chat-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+
+
+def chat_path(cid):
+    return CHATS_DIR / f"{cid}.json"
+
+
+def load_chat(cid):
+    p = chat_path(cid)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def save_chat(chat):
+    ensure_dirs()
+    chat_path(chat["id"]).write_text(json.dumps(chat, ensure_ascii=False, indent=2))
+
+
+def delete_chat_file(cid):
+    p = chat_path(cid)
+    if p.is_file():
+        p.unlink()
+
+
+def all_chats_meta():
+    """Return [{id, title, updated}, ...] sorted by updated desc."""
+    ensure_dirs()
+    out = []
+    for p in CHATS_DIR.glob("chat-*.json"):
+        try:
+            j = json.loads(p.read_text())
+            out.append({
+                "id": j["id"],
+                "title": j.get("title") or "Untitled",
+                "updated": j.get("updated", 0),
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda c: c["updated"], reverse=True)
+    return out
+
+
+def get_active_id():
+    if ACTIVE_FILE.is_file():
+        try:
+            cid = ACTIVE_FILE.read_text().strip()
+            if cid and chat_path(cid).is_file():
+                return cid
+        except Exception:
+            pass
+    return None
+
+
+def set_active_id(cid):
+    ensure_dirs()
+    ACTIVE_FILE.write_text(cid)
+
+
+def make_blank_chat():
+    cid = new_chat_id()
+    now = int(time.time())
+    chat = {
+        "id": cid,
+        "title": "",
+        "created": now,
+        "updated": now,
+        "messages": [],
+    }
+    save_chat(chat)
+    set_active_id(cid)
+    return chat
+
+
+def migrate_legacy():
+    """Convert pre-0.2 ~/.cache/glassbot/history.json into a chat, if present."""
+    if not LEGACY_HISTORY.is_file():
+        return
+    try:
+        msgs = json.loads(LEGACY_HISTORY.read_text())
+    except Exception:
+        msgs = []
+    if msgs:
+        cid = new_chat_id()
+        now = int(time.time())
+        chat = {
+            "id": cid,
+            "title": "Imported history",
+            "created": now,
+            "updated": now,
+            "messages": msgs,
+        }
+        save_chat(chat)
+        if not get_active_id():
+            set_active_id(cid)
+    try:
+        LEGACY_HISTORY.unlink()
+    except Exception:
+        pass
+
+
+def get_or_create_active():
+    """Return the active chat, creating one if missing/none."""
+    ensure_dirs()
+    migrate_legacy()
+    cid = get_active_id()
+    if cid:
+        c = load_chat(cid)
+        if c:
+            return c
+    return make_blank_chat()
+
+
+def append_messages(chat, user_text, assistant_text):
+    chat["messages"].append({"role": "user", "content": user_text})
+    chat["messages"].append({"role": "assistant", "content": assistant_text})
+    if len(chat["messages"]) > MAX_TURNS * 2:
+        chat["messages"] = chat["messages"][-MAX_TURNS * 2:]
+    chat["updated"] = int(time.time())
+    save_chat(chat)
+
+
+def visible_messages(chat):
+    """Strip hidden messages (tool synthetic turns, denial notices) so the
+    UI doesn't display them. The LLM still sees them via chat['messages']."""
+    return [m for m in chat.get("messages", []) if not m.get("hidden")]
+
+
+# ---------------- io helpers ----------------
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def emit_err(msg):
+    emit({"type": "error", "msg": msg})
+
+
+# ---------------- ollama ----------------
+
+class BackendError(Exception):
+    """Transport / API failure raised by a backend stream so the dispatcher
+    can decide whether to fall back. `code` carries the HTTP status when
+    available so the cloud fallback chain can distinguish retryable
+    upstream failures (429/5xx) from auth errors (401/403)."""
+
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
+
+
+def ollama_status(cfg):
+    try:
+        with urllib.request.urlopen(cfg["ollama_url"] + "/api/tags", timeout=3) as r:
+            data = json.loads(r.read())
+        names = [m.get("name", "") for m in data.get("models", [])]
+        want = cfg["model"]
+        present = any(n == want or n.startswith(want.split(":")[0] + ":") for n in names)
+        return {"ok": True, "model": want, "model_present": present, "models": names}
+    except Exception as e:
+        return {"ok": False, "model": cfg["model"], "error": str(e)}
+
+
+def full_status(cfg):
+    """Combined status for IPC: includes Ollama reachability + cloud config."""
+    s = ollama_status(cfg)
+    s["cloud_configured"] = bool(cfg.get("cloud_api_key"))
+    s["cloud_model"] = cfg.get("cloud_model", "")
+    s["cloud_provider"] = cfg.get("cloud_provider", DEFAULT_CLOUD_PROVIDER)
+    s["backend_default"] = effective_backend(cfg)
+    s["backend_config"] = cfg.get("backend", "auto")
+    return s
+
+
+def _ollama_stream(cfg, messages, options=None, stream=True):
+    """Yield content deltas from /api/chat. Raises BackendError on failure."""
+    merged_opts = {
+        "num_ctx": DEFAULT_NUM_CTX,
+        "num_predict": DEFAULT_NUM_PREDICT,
+    }
+    if options:
+        merged_opts.update(options)
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "stream": stream,
+        "keep_alive": KEEP_ALIVE,
+        "options": merged_opts,
+    }
+    req = urllib.request.Request(
+        cfg["ollama_url"] + "/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.URLError as e:
+        raise BackendError(
+            f"Ollama not reachable at {cfg['ollama_url']}: {e}. "
+            "Start it with `sudo systemctl start ollama` and check `ollama list`."
+        )
+    except Exception as e:
+        raise BackendError(f"ollama error: {e}")
+    with resp:
+        for raw in resp:
+            if not raw.strip():
+                continue
+            try:
+                j = json.loads(raw)
+            except Exception:
+                continue
+            if j.get("error"):
+                raise BackendError(f"ollama: {j['error']}")
+            delta = j.get("message", {}).get("content", "")
+            if delta:
+                yield delta
+            if j.get("done"):
+                return
+
+
+def _cloud_stream(cfg, messages, options=None, stream=True, model=None):
+    """Yield content deltas from OpenRouter's OpenAI-compatible
+    /chat/completions endpoint. Raises BackendError on transport / auth /
+    rate-limit failure. `model` overrides cfg["cloud_model"] (used by the
+    fallback-chain wrapper)."""
+    if not cfg.get("cloud_api_key"):
+        raise BackendError("Cloud API key not configured.")
+    opts = options or {}
+    payload = {
+        "model": model or cfg.get("cloud_model") or DEFAULT_CLOUD_MODEL,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": opts.get("num_predict", DEFAULT_NUM_PREDICT),
+        "temperature": opts.get("temperature", 0.7),
+    }
+    req = urllib.request.Request(
+        cfg.get("cloud_url") or OPENROUTER_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg['cloud_api_key']}",
+            # Realistic UA — some CDN frontends (Cloudflare etc.) block the
+            # default Python-urllib agent with a generic challenge response.
+            "User-Agent": "glassbot/0.4 (+https://github.com/) Python-urllib",
+            "Accept": "text/event-stream",
+            # OpenRouter uses these for attribution / leaderboard ranking.
+            # Harmless to send; lets your usage show up under the app name.
+            "HTTP-Referer": "https://github.com/glassyos/glassbot",
+            "X-Title": "glassbot",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        raise BackendError(
+            f"cloud HTTP {e.code}: {body or e.reason}", code=e.code)
+    except urllib.error.URLError as e:
+        raise BackendError(f"cloud unreachable: {e}")
+    except Exception as e:
+        raise BackendError(f"cloud error: {e}")
+    with resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].lstrip()
+            if data == "[DONE]":
+                return
+            try:
+                j = json.loads(data)
+            except Exception:
+                continue
+            choices = j.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0].get("delta") or {}).get("content", "")
+            if delta:
+                yield delta
+
+
+def _cloud_models_chain(cfg):
+    """Ordered list of cloud models to try: configured model first, then the
+    provider's fallback list (de-duplicated)."""
+    prov_id = cfg.get("cloud_provider") or DEFAULT_CLOUD_PROVIDER
+    prov = CLOUD_PROVIDERS.get(prov_id, CLOUD_PROVIDERS[DEFAULT_CLOUD_PROVIDER])
+    chain = [cfg.get("cloud_model") or prov["default_model"]]
+    for m in prov.get("fallback_models", []):
+        if m and m not in chain:
+            chain.append(m)
+    return chain
+
+
+def _cloud_stream_with_fallback(cfg, messages, options=None):
+    """Yield content deltas from the cloud provider, transparently retrying
+    with the next model in the chain when one returns 429 or a 5xx upstream
+    error before producing any token. Auth failures (401/403) abort
+    immediately. Once a model has produced its first token we commit to it.
+    Emits a 'cloud_model_fallback' notice when switching."""
+    chain = _cloud_models_chain(cfg)
+    last_err = None
+    for idx, m in enumerate(chain):
+        gen = _cloud_stream(cfg, messages, options, model=m)
+        try:
+            first = next(gen)
+        except StopIteration:
+            cfg["_last_cloud_model"] = m
+            return
+        except BackendError as e:
+            last_err = e
+            # Auth errors are not retryable across models.
+            if e.code in (401, 403):
+                raise
+            # 429 / 5xx / unknown transport — try next model.
+            if idx + 1 < len(chain):
+                emit({"type": "cloud_model_fallback",
+                      "from": m, "to": chain[idx + 1], "reason": str(e)})
+            continue
+        # First token in hand — commit to this model.
+        cfg["_last_cloud_model"] = m
+        yield first
+        for d in gen:
+            yield d
+        return
+    # All models exhausted.
+    if last_err is not None:
+        raise last_err
+    raise BackendError("cloud: no models available")
+
+
+def chat_stream(cfg, messages, options=None, prefer=None, quiet=False):
+    """Dispatcher. Yields deltas from the chosen backend. Falls back to the
+    other backend only when the preferred one fails BEFORE emitting any token
+    (so we never duplicate output mid-stream).
+
+    `prefer` may be 'cloud', 'local', or None (use cfg["backend"]).
+    Emits a 'backend_used' event before the first delta unless quiet=True.
+    Sets `cfg["_last_backend"]` to whichever backend served the request."""
+    backend_pref = prefer or cfg.get("backend", "auto")
+    have_key = bool(cfg.get("cloud_api_key"))
+
+    if backend_pref == "local":
+        order = ["local"]
+    elif backend_pref == "cloud":
+        order = ["cloud"]
+    elif have_key:
+        order = ["cloud", "local"]
+    else:
+        order = ["local"]
+
+    last_err = None
+    for which in order:
+        gen = (_cloud_stream_with_fallback if which == "cloud" else _ollama_stream)(cfg, messages, options)
+        try:
+            first = next(gen)
+        except StopIteration:
+            cfg["_last_backend"] = which
+            if not quiet:
+                emit({"type": "backend_used", "backend": which})
+            return
+        except BackendError as e:
+            last_err = (which, str(e))
+            continue
+        cfg["_last_backend"] = which
+        if not quiet:
+            emit({"type": "backend_used", "backend": which})
+        yield first
+        try:
+            for d in gen:
+                yield d
+        except BackendError as e:
+            emit_err(f"{which}: {e}")
+        return
+
+    if last_err:
+        emit_err(f"{last_err[0]}: {last_err[1]}")
+
+
+def chat_complete(cfg, messages, options=None, prefer=None, quiet=True):
+    """Non-streaming wrapper. Returns full string or None."""
+    out = []
+    for d in chat_stream(cfg, messages, options, prefer=prefer, quiet=quiet):
+        out.append(d)
+    return "".join(out) if out else None
+
+
+def generate_title(cfg, user_text, assistant_text):
+    """Ask the model for a short title. Best-effort, returns None on failure."""
+    prompt = TITLE_PROMPT.format(
+        user=user_text[:400], assistant=assistant_text[:400],
+    )
+    msgs = [{"role": "user", "content": prompt}]
+    raw = chat_complete(cfg, msgs, options={"num_predict": 24, "temperature": 0.2})
+    if not raw:
+        return None
+    title = raw.strip().splitlines()[0].strip()
+    # Strip common prefix patterns the model adds despite instructions.
+    title = re.sub(r'^\s*(title|titel|chat title|chat-titel)\s*[:\-]\s*', "", title, flags=re.IGNORECASE)
+    title = re.sub(r'^["\'`*_#\s]+|["\'`*_#\s.!?,:;]+$', "", title)
+    title = re.sub(r"\s+", " ", title)
+    # Reject obvious garbage (model echoing its own prompt, etc.)
+    if not title or len(title) > 80:
+        return None
+    return title[:60]
+
+
+# ---------------- search (multi-source) ----------------
+
+_DDG_PAT = re.compile(
+    r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+    r'.*?(?:<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>)',
+    re.DOTALL,
+)
+
+
+def _strip_html(s):
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+def _http_json(url, timeout=8, headers=None):
+    h = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+         "Accept": "application/json"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _http_text(url, timeout=8, headers=None, data=None):
+    h = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h, data=data)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def search_ddg_html(query, limit):
+    """Try DDG HTML scraper. Often blocked → returns []."""
+    try:
+        body = _http_text(
+            "https://html.duckduckgo.com/html/",
+            data=urllib.parse.urlencode({"q": query, "kl": "wt-wt"}).encode("utf-8"),
+            headers={"Referer": "https://duckduckgo.com/"},
+            timeout=10,
+        )
+    except Exception:
+        return []
+    if "anomaly" in body.lower() and "result__a" not in body:
+        return []
+    out = []
+    for m in _DDG_PAT.finditer(body):
+        href = m.group(1)
+        title = _strip_html(m.group(2))
+        snippet = _strip_html(m.group(3) or m.group(4) or "")
+        m2 = re.search(r"[?&]uddg=([^&]+)", href)
+        if m2:
+            href = urllib.parse.unquote(m2.group(1))
+        if href.startswith("//"):
+            href = "https:" + href
+        if title and href:
+            out.append({"title": title, "url": href, "snippet": snippet, "source": "ddg"})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_ddg_instant(query, limit):
+    """DDG Instant Answer API — works for ~Wikipedia-summary-ish queries."""
+    try:
+        j = _http_json(
+            "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
+                "q": query, "format": "json", "no_html": "1", "skip_disambig": "1",
+            }),
+            timeout=8,
+        )
+    except Exception:
+        return []
+    out = []
+    abstract = (j.get("Abstract") or "").strip()
+    abstract_url = (j.get("AbstractURL") or "").strip()
+    heading = (j.get("Heading") or query).strip()
+    if abstract:
+        out.append({
+            "title": heading,
+            "url": abstract_url or "https://duckduckgo.com/?q=" + urllib.parse.quote(query),
+            "snippet": abstract,
+            "source": "ddg-ia",
+        })
+    for rt in (j.get("RelatedTopics") or []):
+        if "Topics" in rt:
+            for sub in rt["Topics"]:
+                if len(out) >= limit:
+                    break
+                t = (sub.get("Text") or "").strip()
+                u = (sub.get("FirstURL") or "").strip()
+                if t and u:
+                    out.append({"title": t.split(" - ")[0][:120],
+                                "url": u, "snippet": t, "source": "ddg-ia"})
+        else:
+            if len(out) >= limit:
+                break
+            t = (rt.get("Text") or "").strip()
+            u = (rt.get("FirstURL") or "").strip()
+            if t and u:
+                out.append({"title": t.split(" - ")[0][:120],
+                            "url": u, "snippet": t, "source": "ddg-ia"})
+    return out[:limit]
+
+
+def search_wikipedia(query, limit):
+    """Wikipedia opensearch + page summaries. Reliable text source."""
+    try:
+        # opensearch returns [query, [titles], [descs], [urls]]
+        j = _http_json(
+            "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
+                "action": "opensearch", "search": query, "limit": str(limit),
+                "namespace": "0", "format": "json",
+            }),
+            timeout=8,
+        )
+    except Exception:
+        return []
+    if not isinstance(j, list) or len(j) < 4:
+        return []
+    titles, descs, urls = j[1], j[2], j[3]
+    out = []
+    for i, title in enumerate(titles[:limit]):
+        url = urls[i] if i < len(urls) else ""
+        snippet = descs[i] if i < len(descs) and descs[i] else ""
+        if not snippet:
+            # Fetch page summary
+            try:
+                slug = urllib.parse.quote(title.replace(" ", "_"))
+                s = _http_json(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{slug}",
+                    timeout=6,
+                )
+                snippet = (s.get("extract") or "")[:400]
+            except Exception:
+                snippet = ""
+        if title and url:
+            out.append({"title": title, "url": url, "snippet": snippet,
+                        "source": "wikipedia"})
+    return out
+
+
+def web_search(query, limit):
+    """Multi-source: try DDG html → DDG instant answer → Wikipedia. Combine."""
+    seen = set()
+    combined = []
+
+    for fn in (search_ddg_html, search_ddg_instant, search_wikipedia):
+        try:
+            results = fn(query, limit)
+        except Exception:
+            results = []
+        for r in results:
+            key = r.get("url") or r.get("title")
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(r)
+            if len(combined) >= limit:
+                return combined
+    return combined
+
+
+# ---------------- chat orchestration ----------------
+
+_SLASH_SEARCH = re.compile(r"^\s*/search\s*", re.IGNORECASE)
+_SLASH_NOSEARCH = re.compile(r"^\s*/(nosearch|nolookup)\s*", re.IGNORECASE)
+_SLASH_LOCAL = re.compile(r"^\s*/local\s*", re.IGNORECASE)
+_SLASH_CLOUD = re.compile(r"^\s*/cloud\s*", re.IGNORECASE)
+_SLASH_RESET = re.compile(r"^\s*/(reset|clear|new)\s*$", re.IGNORECASE)
+# /read can appear anywhere in the message — we extract every @path it
+# describes and prepend file contents to the LLM input. Format:
+#   /read <path>  [optional follow-up prompt]
+_SLASH_READ = re.compile(r"/read\s+(\S+)", re.IGNORECASE)
+
+
+def parse_slash_flags(text):
+    """Strip leading slash flags off the text in any order. Returns
+    (clean_text, {force_local, force_cloud, no_search, force_search})."""
+    flags = {"force_local": False, "force_cloud": False,
+             "no_search": False, "force_search": False}
+    while True:
+        if _SLASH_LOCAL.match(text):
+            flags["force_local"] = True
+            text = _SLASH_LOCAL.sub("", text, count=1)
+        elif _SLASH_CLOUD.match(text):
+            flags["force_cloud"] = True
+            text = _SLASH_CLOUD.sub("", text, count=1)
+        elif _SLASH_NOSEARCH.match(text):
+            flags["no_search"] = True
+            text = _SLASH_NOSEARCH.sub("", text, count=1)
+        elif _SLASH_SEARCH.match(text):
+            flags["force_search"] = True
+            text = _SLASH_SEARCH.sub("", text, count=1)
+        else:
+            break
+    return text.strip(), flags
+
+# Heuristic: detect questions that almost certainly need fresh web data.
+# We err on the side of NOT searching — false positives cost a slow round-trip,
+# false negatives just mean the user can prefix /search.
+_AUTO_SEARCH_PATTERNS = [
+    # Time-sensitive English
+    r"\btoday\b", r"\btonight\b", r"\btomorrow\b", r"\byesterday\b",
+    r"\bcurrent(ly)?\b", r"\blatest\b", r"\brecent(ly)?\b", r"\bbreaking\b",
+    r"\bright now\b", r"\bjust now\b", r"\bthis (week|month|year)\b",
+    r"\bnews\b",
+    # Time-sensitive German
+    r"\bheute\b", r"\bgestern\b", r"\bmorgen\b", r"\baktuell(e|er|en|es)?\b",
+    r"\bneueste(r|n|s)?\b", r"\bneuste(r|n|s)?\b", r"\bnachrichten\b",
+    r"\bgerade jetzt\b", r"\bdiese[ns]? (woche|monat|jahr)\b",
+    r"\bkürzlich\b",
+    # Real-world data lookups
+    r"\bweather\b", r"\bwetter\b", r"\btemperature\b", r"\btemperatur\b",
+    r"\bforecast\b", r"\bvorhersage\b",
+    r"\bstock( price)?\b", r"\baktienkurs\b", r"\baktien?\b",
+    r"\bexchange rate\b", r"\bwechselkurs\b", r"\bcrypto\b", r"\bbitcoin\b", r"\bethereum\b",
+    r"\bscore\b", r"\bspielergebnis\b", r"\bergebnis(se)?\b",
+    r"\bschedule\b", r"\bspielplan\b", r"\bfahrplan\b",
+    # Software/version lookups
+    r"\blatest version\b", r"\baktuelle version\b", r"\bneueste version\b",
+    r"\brelease(d)? (today|yesterday|recently)\b", r"\bchangelog\b",
+    # Explicit recent-year markers (current and previous year)
+    r"\b(2025|2026)\b",
+    # Live events
+    r"\b(election|wahl|olympics|olympia|world cup|wm|em|super bowl)\b",
+]
+_AUTO_SEARCH_RE = re.compile("|".join(_AUTO_SEARCH_PATTERNS), re.IGNORECASE)
+
+# Pure code-/text-task prefixes that override even time signals (rare).
+# We only match the *very first* word of the message; once any time/data
+# pattern is in the text we trust the user wanted live info.
+_PURE_TASK_PREFIX = re.compile(
+    r"^\s*(translate|übersetze|debug|refactor|fix this|generate code|code\s+\w)",
+    re.IGNORECASE,
+)
+
+
+def needs_web_search(text):
+    if _PURE_TASK_PREFIX.match(text):
+        return False
+    return bool(_AUTO_SEARCH_RE.search(text))
+
+
+def warm_model(cfg):
+    """Trigger ollama to load the model so first user turn isn't cold."""
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                cfg["ollama_url"] + "/api/chat",
+                data=json.dumps({
+                    "model": cfg["model"],
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "stream": False,
+                    "keep_alive": KEEP_ALIVE,
+                    "options": {"num_predict": 1},
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=120,
+        ).read()
+    except Exception:
+        pass
+
+
+def handle_chat(cfg, chat, user_text, force_search=False):
+    """Chat turn. Streams deltas, persists to chat, may auto-title."""
+    if _SLASH_RESET.match(user_text):
+        # In multi-chat mode, /reset starts a fresh chat (keeps existing ones).
+        new = make_blank_chat()
+        emit({"type": "chat_loaded", "id": new["id"], "title": "",
+              "messages": []})
+        emit({"type": "chats_refresh", "items": all_chats_meta(),
+              "active_id": new["id"]})
+        emit({"type": "end", "search_used": False, "active_id": new["id"]})
+        return new
+
+    user_text, flags = parse_slash_flags(user_text)
+    explicit_search = flags["force_search"]
+    explicit_no_search = flags["no_search"]
+    prefer_backend = (
+        "local" if flags["force_local"]
+        else "cloud" if flags["force_cloud"]
+        else None
+    )
+
+    # /read <path> — pull file contents into the prompt. The user typing
+    # this is implicit consent. Multiple /read clauses in one message stack.
+    file_blocks = []
+    file_paths_done = []
+    def _swallow_read(match):
+        path = match.group(1)
+        ok, body, meta = safe_read_file(path)
+        if ok:
+            note = ""
+            if meta.get("truncated_bytes") or meta.get("truncated_lines"):
+                note = "  [truncated]"
+            file_blocks.append(
+                f"--- file: {meta['path']}{note} ---\n{body}\n--- end {meta['path']} ---"
+            )
+            file_paths_done.append(meta["path"])
+        else:
+            file_blocks.append(f"--- file: {path} (error: {body}) ---")
+        return ""
+    user_text = _SLASH_READ.sub(_swallow_read, user_text).strip()
+    if file_paths_done:
+        emit({"type": "files_read", "paths": file_paths_done})
+
+    auto_search = (
+        not explicit_search
+        and not explicit_no_search
+        and not force_search
+        and needs_web_search(user_text)
+    )
+    do_search = (explicit_search or force_search or auto_search) and not explicit_no_search
+    search_used = False
+
+    if do_search:
+        query = user_text
+        results = web_search(query, cfg["search_results"])
+        if not results:
+            emit_err("Search returned no results (DDG/Wikipedia all failed).")
+            emit({"type": "end", "search_used": False, "active_id": chat["id"]})
+            return chat
+        emit({"type": "search_results", "items": results, "query": query})
+        snippet_block = "\n".join(
+            f"[{i + 1}] {r['title']}  ({r.get('source', '')})\n    {r['url']}\n    {r['snippet']}"
+            for i, r in enumerate(results)
+        )
+        model_input = (
+            f"[Web search results for: {query}]\n{snippet_block}\n"
+            f"[End of results — answer the user's question using these sources, citing them by [n].]\n\n"
+            f"User question: {user_text}"
+        )
+        search_used = True
+    else:
+        model_input = user_text
+
+    if file_blocks:
+        model_input = (
+            "[The user attached the following file(s) for context. "
+            "Read them and answer with reference to the actual contents.]\n\n"
+            + "\n\n".join(file_blocks)
+            + f"\n\nUser question: {user_text or '(no question — describe / review the file(s))'}"
+        )
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(chat["messages"])
+    messages.append({"role": "user", "content": model_input})
+
+    full = []
+    got_anything = False
+    for delta in chat_stream(cfg, messages, prefer=prefer_backend):
+        got_anything = True
+        full.append(delta)
+        emit({"type": "delta", "text": delta})
+
+    if not got_anything:
+        emit({"type": "end", "search_used": search_used, "active_id": chat["id"]})
+        return chat
+
+    final = "".join(full)
+    append_messages(chat, user_text, final)
+
+    # Tool execution: scan the assistant reply for <<RUN: cmd>> markers and
+    # surface each as an approval request. We don't auto-run anything.
+    if cfg.get("tools_enabled", True):
+        for call in parse_tool_calls(final):
+            _PENDING_TOOLS[call["id"]] = {
+                "command": call["command"], "chat_id": chat["id"],
+            }
+            emit({"type": "tool_request",
+                  "id": call["id"], "command": call["command"]})
+
+    # Auto-title after the very first turn (use whichever backend served the
+    # main turn; cloud is preferred when available, so titles are fast).
+    title_changed = False
+    if not chat.get("title"):
+        title = generate_title(cfg, user_text, final) or user_text[:40].strip()
+        if title:
+            chat["title"] = title
+            save_chat(chat)
+            title_changed = True
+
+    emit({"type": "end", "search_used": search_used, "active_id": chat["id"]})
+    if title_changed:
+        emit({"type": "chats_refresh", "items": all_chats_meta(),
+              "active_id": chat["id"]})
+    return chat
+
+
+def handle_tool_result(cfg, chat, command, result):
+    """Feed a finished tool's output back into the conversation. Streams a
+    new assistant turn that reasons about the output."""
+    output = result.get("output") or ""
+    err = result.get("error") or ""
+    exit_code = result.get("exit_code", -1)
+    pieces = [f"[command output for `{command}` — exit {exit_code}]"]
+    if err:
+        pieces.append(f"[error] {err}")
+    if output:
+        pieces.append(output)
+    if result.get("truncated"):
+        pieces.append("[output truncated]")
+    if not output and not err:
+        pieces.append("(no output)")
+    synthetic_user = "\n".join(pieces)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(chat["messages"])
+    messages.append({"role": "user", "content": synthetic_user})
+
+    full = []
+    got_anything = False
+    for delta in chat_stream(cfg, messages):
+        got_anything = True
+        full.append(delta)
+        emit({"type": "delta", "text": delta})
+
+    final = "".join(full) if got_anything else ""
+    if final:
+        # Persist a hidden user msg + the assistant follow-up so the chat
+        # has a coherent record. Frontend filters tool-output user messages
+        # by the "[command output for ..." prefix.
+        chat["messages"].append({"role": "user", "content": synthetic_user,
+                                  "hidden": True, "tool_output": True})
+        chat["messages"].append({"role": "assistant", "content": final})
+        chat["updated"] = int(time.time())
+        save_chat(chat)
+        # Recurse on any new tool calls in the follow-up.
+        if cfg.get("tools_enabled", True):
+            for call in parse_tool_calls(final):
+                _PENDING_TOOLS[call["id"]] = {
+                    "command": call["command"], "chat_id": chat["id"],
+                }
+                emit({"type": "tool_request",
+                      "id": call["id"], "command": call["command"]})
+
+    emit({"type": "end", "search_used": False, "active_id": chat["id"]})
+    return chat
+
+
+# ---------------- IPC entry ----------------
+
+def cmd_ipc():
+    cfg = load_config()
+    chat = get_or_create_active()
+    status = full_status(cfg)
+    emit({"type": "status", **status})
+    emit({
+        "type": "boot_state",
+        "active_id": chat["id"],
+        "messages": visible_messages(chat),
+        "chats": all_chats_meta(),
+        "setup_done": bool(cfg.get("setup_done")),
+        "suggested_models": SUGGESTED_MODELS,
+        "installed_models": list_installed_models(cfg),
+        "providers": [
+            {"id": pid, "label": p["label"], "tagline": p["tagline"],
+             "key_page": p["key_page"], "default_model": p["default_model"]}
+            for pid, p in CLOUD_PROVIDERS.items()
+        ],
+    })
+    # Pre-load the local model only if it might actually be used. With cloud
+    # as default we skip the warm-up to avoid spinning up Ollama unnecessarily.
+    if (status.get("ok") and status.get("model_present")
+            and effective_backend(cfg) == "local"):
+        try:
+            import threading
+            threading.Thread(target=warm_model, args=(cfg,), daemon=True).start()
+        except Exception:
+            pass
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+        except Exception as e:
+            emit_err(f"bad JSON: {e}")
+            continue
+        t = cmd.get("type")
+
+        if t == "chat":
+            chat = handle_chat(cfg, chat, cmd.get("text", ""), False)
+        elif t == "search":
+            chat = handle_chat(cfg, chat, cmd.get("text", ""), True)
+
+        elif t == "boot":
+            emit({
+                "type": "boot_state",
+                "active_id": chat["id"],
+                "messages": visible_messages(chat),
+                "chats": all_chats_meta(),
+            })
+
+        elif t == "list_chats":
+            emit({"type": "chats_refresh",
+                  "items": all_chats_meta(), "active_id": chat["id"]})
+
+        elif t == "new_chat":
+            chat = make_blank_chat()
+            emit({"type": "chat_loaded", "id": chat["id"],
+                  "title": "", "messages": []})
+            emit({"type": "chats_refresh",
+                  "items": all_chats_meta(), "active_id": chat["id"]})
+
+        elif t == "open_chat":
+            cid = cmd.get("id", "")
+            c = load_chat(cid)
+            if not c:
+                emit_err(f"chat {cid!r} not found")
+                continue
+            chat = c
+            set_active_id(cid)
+            emit({"type": "chat_loaded", "id": chat["id"],
+                  "title": chat.get("title", ""), "messages": visible_messages(chat)})
+
+        elif t == "delete_chat":
+            cid = cmd.get("id", "")
+            delete_chat_file(cid)
+            if chat["id"] == cid:
+                # active was deleted — pick newest remaining or create blank
+                metas = all_chats_meta()
+                if metas:
+                    chat = load_chat(metas[0]["id"]) or make_blank_chat()
+                    set_active_id(chat["id"])
+                else:
+                    chat = make_blank_chat()
+                emit({"type": "chat_loaded", "id": chat["id"],
+                      "title": chat.get("title", ""),
+                      "messages": visible_messages(chat)})
+            emit({"type": "chats_refresh",
+                  "items": all_chats_meta(), "active_id": chat["id"]})
+
+        elif t == "rename_chat":
+            cid = cmd.get("id", "")
+            title = (cmd.get("title") or "").strip()[:60]
+            c = load_chat(cid)
+            if c is None:
+                emit_err(f"chat {cid!r} not found")
+                continue
+            c["title"] = title
+            c["updated"] = int(time.time())
+            save_chat(c)
+            if chat["id"] == cid:
+                chat = c
+            emit({"type": "chats_refresh",
+                  "items": all_chats_meta(), "active_id": chat["id"]})
+
+        elif t == "ping":
+            emit({"type": "status", **full_status(cfg)})
+
+        elif t == "setup_state":
+            emit({
+                "type": "setup_state",
+                "done": bool(cfg.get("setup_done")),
+                "suggested_models": SUGGESTED_MODELS,
+                "installed_models": list_installed_models(cfg),
+                "current_local_model": cfg.get("model"),
+                "current_cloud_model": cfg.get("cloud_model"),
+                "cloud_configured": bool(cfg.get("cloud_api_key")),
+                "cloud_provider": cfg.get("cloud_provider", DEFAULT_CLOUD_PROVIDER),
+                "providers": [
+                    {"id": pid, "label": p["label"], "tagline": p["tagline"],
+                     "key_page": p["key_page"], "default_model": p["default_model"]}
+                    for pid, p in CLOUD_PROVIDERS.items()
+                ],
+            })
+
+        elif t == "setup_install_model":
+            name = (cmd.get("name") or "").strip()
+            if not name:
+                emit_err("setup_install_model: missing 'name'")
+                continue
+            installed = list_installed_models(cfg)
+            if name in installed:
+                emit({"type": "setup_progress", "stage": "pull",
+                      "message": f"{name} already installed", "percent": 100})
+                save_config_patch({"model": name})
+                cfg["model"] = name
+                emit({"type": "setup_result", "stage": "model",
+                      "ok": True, "model": name})
+                continue
+            emit({"type": "setup_progress", "stage": "pull",
+                  "message": f"Pulling {name}…", "percent": 0})
+            last_error = None
+            for ev in ollama_pull_stream(cfg, name):
+                if ev.get("error"):
+                    last_error = ev["error"]
+                    break
+                if ev.get("done"):
+                    break
+                emit({"type": "setup_progress", "stage": "pull",
+                      "message": ev.get("status", "downloading"),
+                      "percent": ev.get("percent")})
+            if last_error:
+                emit({"type": "setup_result", "stage": "model",
+                      "ok": False, "error": last_error})
+            else:
+                save_config_patch({"model": name})
+                cfg["model"] = name
+                emit({"type": "setup_result", "stage": "model",
+                      "ok": True, "model": name})
+
+        elif t == "setup_save_key":
+            key = (cmd.get("key") or "").strip()
+            prov_id = (cmd.get("provider") or
+                       cfg.get("cloud_provider") or DEFAULT_CLOUD_PROVIDER)
+            if prov_id not in CLOUD_PROVIDERS:
+                prov_id = DEFAULT_CLOUD_PROVIDER
+            ok, msg = validate_cloud_key(cfg, key, provider=prov_id)
+            if ok:
+                prov = CLOUD_PROVIDERS[prov_id]
+                # Switch URL + default model to match the chosen provider.
+                save_config_patch({
+                    "cloud_api_key": key,
+                    "cloud_provider": prov_id,
+                    "cloud_url": prov["url"],
+                    "cloud_model": prov["default_model"],
+                })
+                cfg["cloud_api_key"] = key
+                cfg["cloud_provider"] = prov_id
+                cfg["cloud_url"] = prov["url"]
+                cfg["cloud_model"] = prov["default_model"]
+            emit({"type": "setup_result", "stage": "key",
+                  "ok": ok, "message": msg, "provider": prov_id})
+
+        elif t == "setup_finish":
+            patch = {"setup_done": True}
+            if "backend" in cmd:
+                patch["backend"] = cmd["backend"]
+            save_config_patch(patch)
+            cfg["setup_done"] = True
+            if "backend" in cmd:
+                cfg["backend"] = cmd["backend"]
+            # Re-emit status so the UI sees the new defaults.
+            emit({"type": "status", **full_status(cfg)})
+            emit({"type": "setup_result", "stage": "finish", "ok": True})
+
+        elif t == "setup_skip":
+            # User skipped without picking a local model. Mark done and
+            # default to cloud-only routing if a key is configured.
+            patch = {"setup_done": True}
+            if cfg.get("cloud_api_key"):
+                patch["backend"] = "cloud"
+            save_config_patch(patch)
+            cfg["setup_done"] = True
+            cfg["backend"] = patch.get("backend", cfg.get("backend"))
+            emit({"type": "status", **full_status(cfg)})
+            emit({"type": "setup_result", "stage": "skip", "ok": True})
+
+        elif t == "setup_reset":
+            # Lets the user re-trigger onboarding from a "Reset glassbot"
+            # action. Doesn't wipe chats or the API key — only the flag.
+            save_config_patch({"setup_done": False})
+            cfg["setup_done"] = False
+            emit({"type": "setup_state", "done": False,
+                  "suggested_models": SUGGESTED_MODELS,
+                  "installed_models": list_installed_models(cfg),
+                  "current_local_model": cfg.get("model"),
+                  "current_cloud_model": cfg.get("cloud_model"),
+                  "cloud_configured": bool(cfg.get("cloud_api_key"))})
+
+        elif t == "read_file":
+            path = cmd.get("path", "")
+            ok, body, meta = safe_read_file(path)
+            emit({"type": "file_read", "ok": ok,
+                  "content": body if ok else "",
+                  "error": "" if ok else body,
+                  **(meta if ok else {"path": path})})
+
+        elif t == "tool_approve":
+            tid = cmd.get("id", "")
+            pending = _PENDING_TOOLS.pop(tid, None)
+            if not pending:
+                emit_err(f"unknown tool id: {tid}")
+                continue
+            command = pending["command"]
+            emit({"type": "tool_running", "id": tid, "command": command})
+            result = run_tool(command)
+            emit({"type": "tool_result", "id": tid, "command": command,
+                  **result})
+            chat = handle_tool_result(cfg, chat, command, result)
+
+        elif t == "tool_deny":
+            tid = cmd.get("id", "")
+            pending = _PENDING_TOOLS.pop(tid, None)
+            if not pending:
+                emit_err(f"unknown tool id: {tid}")
+                continue
+            emit({"type": "tool_denied", "id": tid,
+                  "command": pending["command"]})
+            # Also tell the model so it doesn't keep proposing the same cmd.
+            denial_msg = (f"[user denied running `{pending['command']}` — "
+                          f"don't propose this exact command again unless asked]")
+            chat["messages"].append({"role": "user", "content": denial_msg,
+                                      "hidden": True})
+            chat["updated"] = int(time.time())
+            save_chat(chat)
+
+        elif t == "tool_run":
+            # User-initiated direct command (e.g. via /run slash). Same approval-
+            # bypass risk applies — we still apply the blocklist.
+            command = (cmd.get("command") or "").strip()
+            if not command:
+                emit_err("tool_run: missing 'command'")
+                continue
+            emit({"type": "tool_running", "id": "direct", "command": command})
+            result = run_tool(command)
+            emit({"type": "tool_result", "id": "direct", "command": command,
+                  **result})
+            chat = handle_tool_result(cfg, chat, command, result)
+
+        else:
+            emit_err(f"unknown command: {t!r}")
+
+
+# ---------------- one-shot CLI ----------------
+
+def cmd_oneshot(args):
+    cfg = load_config()
+    chat = get_or_create_active()
+    text = " ".join(args).strip()
+    if not text:
+        text = sys.stdin.read().strip()
+    if not text:
+        sys.stderr.write("glassbot: nothing to ask\n")
+        sys.exit(2)
+
+    text, flags = parse_slash_flags(text)
+    prefer_backend = (
+        "local" if flags["force_local"]
+        else "cloud" if flags["force_cloud"]
+        else None
+    )
+    do_search = flags["force_search"] or (
+        not flags["no_search"] and needs_web_search(text)
+    )
+
+    if do_search:
+        query = text
+        results = web_search(query, cfg["search_results"])
+        if not results:
+            sys.stderr.write("search failed (DDG/Wikipedia all empty)\n")
+            sys.exit(1)
+        sys.stderr.write(f"[search: {query}]\n")
+        for i, r in enumerate(results):
+            sys.stderr.write(f"  [{i + 1}] {r['title']}  ({r.get('source', '')})\n      {r['url']}\n")
+        snippet_block = "\n".join(
+            f"[{i + 1}] {r['title']}\n    {r['url']}\n    {r['snippet']}"
+            for i, r in enumerate(results)
+        )
+        model_input = (
+            f"[Web search results for: {query}]\n{snippet_block}\n"
+            f"[End of results — answer using these, cite by [n].]\n\n"
+            f"User question: {text}"
+        )
+    else:
+        model_input = text
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(chat["messages"])
+    messages.append({"role": "user", "content": model_input})
+
+    full = []
+    for delta in chat_stream(cfg, messages, prefer=prefer_backend, quiet=True):
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+        full.append(delta)
+    sys.stdout.write("\n")
+
+    if full:
+        append_messages(chat, text, "".join(full))
+        if not chat.get("title"):
+            title = generate_title(cfg, text, "".join(full)) or text[:40].strip()
+            if title:
+                chat["title"] = title
+                save_chat(chat)
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        cmd_oneshot([])
+        return
+    if argv[0] == "--version":
+        print(f"glassbot-backend {VERSION}")
+        return
+    if argv[0] == "--ipc":
+        cmd_ipc()
+        return
+    if argv[0] == "status":
+        cfg = load_config()
+        print(json.dumps(full_status(cfg), indent=2))
+        return
+    if argv[0] == "reset":
+        ensure_dirs()
+        for p in CHATS_DIR.glob("chat-*.json"):
+            p.unlink()
+        if ACTIVE_FILE.is_file():
+            ACTIVE_FILE.unlink()
+        if LEGACY_HISTORY.is_file():
+            LEGACY_HISTORY.unlink()
+        print("all chats deleted")
+        return
+    if argv[0] in ("chat", "search", "ask"):
+        rest = argv[1:]
+        if argv[0] == "search":
+            rest = ["/search", *rest]
+        cmd_oneshot(rest)
+        return
+    cmd_oneshot(argv)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
