@@ -49,12 +49,27 @@ Item {
     readonly property bool empty: messages.length === 0 && streamingText === "" && !thinking
 
     // ----- Backend bridge -----
+    // Resolve the backend path PORTABLY instead of hard-coding /home/<user>:
+    //   1. $GLASSBOT_BACKEND if set (explicit override),
+    //   2. $HOME/.local/bin/glassbot-backend (default install location),
+    //   3. bare "glassbot-backend" (fall back to PATH lookup).
+    // Quickshell launches with a stripped PATH that usually omits ~/.local/bin,
+    // which is why a bare command name alone never resolved before. Using $HOME
+    // instead of a literal /home/elias fixes the silent auto-respawn loop for
+    // every username other than "elias".
+    readonly property string backendPath: {
+        const override = Quickshell.env("GLASSBOT_BACKEND");
+        if (override && override !== "")
+            return override;
+        const home = Quickshell.env("HOME");
+        if (home && home !== "")
+            return home + "/.local/bin/glassbot-backend";
+        return "glassbot-backend";
+    }
+
     Process {
         id: bot
-        // Absolute path: Quickshell launches with a stripped PATH that
-        // doesn't include ~/.local/bin, so a bare "glassbot-backend" never
-        // resolved and the auto-respawn was looping silently.
-        command: ["/home/elias/.local/bin/glassbot-backend", "--ipc"]
+        command: [root.backendPath, "--ipc"]
         running: true
         stdinEnabled: true
 
@@ -608,22 +623,22 @@ Item {
                             id: streamingBubble
                             anchors.left: parent.left
                             width: Math.min(parent.width * 0.85,
-                                            Math.max(140, streamText.implicitWidth + 24))
-                            height: streamText.implicitHeight + 16
+                                            Math.max(140, streamText.implicitWidth + 28))
+                            height: streamText.implicitHeight + 22
                             radius: 14
                             color: theme.surface0
 
                             Text {
                                 id: streamText
                                 anchors.fill: parent
-                                anchors.leftMargin: 12
-                                anchors.rightMargin: 12
-                                anchors.topMargin: 8
-                                anchors.bottomMargin: 8
+                                anchors.leftMargin: 14
+                                anchors.rightMargin: 14
+                                anchors.topMargin: 10
+                                anchors.bottomMargin: 10
                                 text: root.streamingText !== "" ? root.streamingText : "thinking..."
                                 wrapMode: Text.Wrap
                                 color: theme.text
-                                font.pixelSize: 13
+                                font.pixelSize: 15
                                 opacity: root.streamingText !== "" ? 1.0 : 0.55
                                 textFormat: Text.PlainText
                             }
@@ -644,8 +659,8 @@ Item {
                         anchors.right: msg.role === "user" ? parent.right : undefined
                         anchors.left: msg.role === "user" ? undefined : parent.left
                         width: Math.min(parent.width * 0.88,
-                                        Math.max(60, bubbleText.implicitWidth + 24))
-                        height: bubbleText.implicitHeight + 16
+                                        Math.max(60, bubbleText.implicitWidth + 28))
+                        height: bubbleText.implicitHeight + 22
                         radius: 14
                         color: msg.role === "user" ? theme.surface2 : theme.surface0
                         border.width: msg.search ? 1 : 0
@@ -654,14 +669,14 @@ Item {
                         Text {
                             id: bubbleText
                             anchors.fill: parent
-                            anchors.leftMargin: 12
-                            anchors.rightMargin: 12
-                            anchors.topMargin: 8
-                            anchors.bottomMargin: 8
+                            anchors.leftMargin: 14
+                            anchors.rightMargin: 14
+                            anchors.topMargin: 10
+                            anchors.bottomMargin: 10
                             text: msg.text || msg.content || ""
                             color: theme.text
                             wrapMode: Text.Wrap
-                            font.pixelSize: 13
+                            font.pixelSize: 15
                             textFormat: Text.PlainText
                         }
                     }
@@ -677,7 +692,7 @@ Item {
                         id: ebubble
                         anchors.left: parent.left
                         width: Math.min(parent.width * 0.88, etext.implicitWidth + 24)
-                        height: etext.implicitHeight + 16
+                        height: etext.implicitHeight + 22
                         radius: 14
                         color: Qt.alpha(theme.red, 0.18)
                         border.width: 1
@@ -692,7 +707,7 @@ Item {
                             text: msg.text || msg.content || ""
                             color: theme.red
                             wrapMode: Text.Wrap
-                            font.pixelSize: 12
+                            font.pixelSize: 14
                             textFormat: Text.PlainText
                         }
                     }
@@ -980,8 +995,8 @@ Item {
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
                 anchors.margins: 12
-                height: 46
-                radius: 23
+                height: 52
+                radius: 26
                 color: theme.surface0
                 border.width: 1
                 border.color: input.activeFocus
@@ -1020,8 +1035,8 @@ Item {
                                 ? "thinking..."
                                 : "ask glassbot   ·   /search ...   ·   /new"
                         color: theme.text
-                        placeholderTextColor: theme.subtext0
-                        font.pixelSize: 13
+                        placeholderTextColor: Qt.alpha(theme.text, 0.45)
+                        font.pixelSize: 15
                         selectByMouse: true
                         background: Item {}
                         enabled: !root.thinking && root.ollamaStatus !== "down"
@@ -1034,7 +1049,7 @@ Item {
                     }
 
                     Rectangle {
-                        width: 32; height: 32; radius: 16
+                        width: 36; height: 36; radius: 18
                         anchors.verticalCenter: parent.verticalCenter
                         color: input.text.length > 0 && !root.thinking && root.ollamaStatus === "ok"
                             ? theme.blue
@@ -1045,7 +1060,7 @@ Item {
                             anchors.centerIn: parent
                             text: "→"
                             color: theme.base
-                            font.pixelSize: 15
+                            font.pixelSize: 17
                             font.bold: true
                         }
 
@@ -1120,7 +1135,7 @@ Item {
                 anchors.leftMargin: 16
                 text: "Chats"
                 color: theme.text
-                font.pixelSize: 13
+                font.pixelSize: 15
                 font.bold: true
                 opacity: 0.75
             }
@@ -1134,8 +1149,8 @@ Item {
                 anchors.right: parent.right
                 anchors.leftMargin: 10
                 anchors.rightMargin: 10
-                height: 34
-                radius: 10
+                height: 40
+                radius: 11
                 color: newChatHover.containsMouse
                     ? Qt.alpha(theme.blue, 0.22)
                     : Qt.alpha(theme.surface0, 0.7)
@@ -1149,14 +1164,14 @@ Item {
                     Text {
                         text: "+"
                         color: theme.text
-                        font.pixelSize: 16
+                        font.pixelSize: 19
                         font.bold: true
                         anchors.verticalCenter: parent.verticalCenter
                     }
                     Text {
                         text: "New chat"
                         color: theme.text
-                        font.pixelSize: 13
+                        font.pixelSize: 15
                         anchors.verticalCenter: parent.verticalCenter
                     }
                 }
@@ -1196,9 +1211,10 @@ Item {
                 delegate: Rectangle {
                     id: chatRow
                     width: chatList.width
-                    height: 32
-                    radius: 8
+                    height: 40
+                    radius: 9
                     property bool isActive: modelData.id === root.activeId
+                    property bool confirmDel: false
                     color: isActive
                         ? Qt.alpha(theme.blue, 0.20)
                         : (rowHover.containsMouse ? Qt.alpha(theme.text, 0.06) : "transparent")
@@ -1213,8 +1229,8 @@ Item {
                         text: (modelData.title && modelData.title.length > 0)
                             ? modelData.title
                             : "New chat"
-                        color: chatRow.isActive ? theme.text : Qt.alpha(theme.text, 0.82)
-                        font.pixelSize: 12
+                        color: chatRow.isActive ? theme.text : Qt.alpha(theme.text, 0.92)
+                        font.pixelSize: 14
                         font.bold: chatRow.isActive
                         elide: Text.ElideRight
                     }
@@ -1224,20 +1240,31 @@ Item {
                         anchors.right: parent.right
                         anchors.rightMargin: 6
                         anchors.verticalCenter: parent.verticalCenter
-                        width: 20; height: 20
-                        radius: 10
-                        color: delHover.containsMouse
-                            ? Qt.alpha(theme.red, 0.32)
+                        width: 24; height: 24
+                        radius: 12
+                        color: (delHover.containsMouse || chatRow.confirmDel)
+                            ? Qt.alpha(theme.red, 0.35)
                             : "transparent"
-                        opacity: rowHover.containsMouse || delHover.containsMouse ? 1.0 : 0.0
+                        // immer sichtbar (dezent) -> man findet den Button auch ohne Hover
+                        opacity: chatRow.confirmDel ? 1.0 : (delHover.containsMouse ? 1.0 : 0.55)
                         Behavior on opacity { NumberAnimation { duration: 120 } }
                         Behavior on color { ColorAnimation { duration: 120 } }
 
+                        ToolTip.visible: delHover.containsMouse
+                        ToolTip.text: chatRow.confirmDel ? "click again to delete" : "delete chat"
+                        ToolTip.delay: 500
+
                         Text {
                             anchors.centerIn: parent
-                            text: "✕"
-                            color: delHover.containsMouse ? theme.red : Qt.alpha(theme.text, 0.7)
-                            font.pixelSize: 11
+                            text: chatRow.confirmDel ? "✕" : "🗑"
+                            color: chatRow.confirmDel ? theme.red : Qt.alpha(theme.text, 0.75)
+                            font.pixelSize: chatRow.confirmDel ? 15 : 13
+                        }
+
+                        Timer {
+                            id: confirmTimer
+                            interval: 2600
+                            onTriggered: chatRow.confirmDel = false
                         }
 
                         MouseArea {
@@ -1245,7 +1272,15 @@ Item {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.deleteChat(modelData.id)
+                            onClicked: {
+                                if (!chatRow.confirmDel) {          // 1. Klick: sicher fragen
+                                    chatRow.confirmDel = true;
+                                    confirmTimer.restart();
+                                } else {                            // 2. Klick: löschen
+                                    chatRow.confirmDel = false;
+                                    root.deleteChat(modelData.id);
+                                }
+                            }
                         }
                     }
 
@@ -1267,8 +1302,8 @@ Item {
                     anchors.centerIn: parent
                     visible: root.chats.length === 0
                     text: "No chats yet"
-                    color: Qt.alpha(theme.text, 0.4)
-                    font.pixelSize: 12
+                    color: Qt.alpha(theme.text, 0.6)
+                    font.pixelSize: 14
                     font.italic: true
                 }
             }

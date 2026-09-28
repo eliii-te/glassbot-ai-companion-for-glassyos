@@ -489,11 +489,13 @@ printf '%s\n' '{"type":"boot"}' '{"type":"chat","text":"hi"}' \
   both `XDG_RUNTIME_DIR` **and** `WAYLAND_DISPLAY=wayland-1` — otherwise Quickshell
   says *"No running instances … current display unk"*. Example:
   `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 quickshell … ipc call main forceReload`.
-- **The widget is launched with an absolute path.** `Glassbot.qml` spawns
-  `/home/elias/.local/bin/glassbot-backend` by hard-coded path (Quickshell runs with
-  a stripped `PATH` that doesn't include `~/.local/bin`, so a bare command name
-  never resolved). If your username isn't `elias`, edit that line — or the auto-
-  respawn will loop silently.
+- **The backend path is resolved portably (no more hard-coded `/home/…`).**
+  `Glassbot.qml` now picks the backend in this order:
+  `$GLASSBOT_BACKEND` (explicit override) → `$HOME/.local/bin/glassbot-backend`
+  (default install location) → bare `glassbot-backend` on `PATH`. Older builds
+  hard-coded `/home/elias/.local/bin/glassbot-backend`, which broke (silent
+  auto-respawn loop) for any username other than `elias`. If you installed the
+  backend somewhere else, just export `GLASSBOT_BACKEND=/path/to/glassbot-backend`.
 - **`QML font.pixelSize` must be an integer.** A value like `14.5` fails with
   *"Invalid property assignment: int expected"* and the widget simply doesn't appear
   — the only clue is in the Quickshell log
